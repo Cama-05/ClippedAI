@@ -8,3 +8,4 @@ scipy>=1.10.0
 numpy>=1.24.0
 yt-dlp
 youtube-transcript-api
+mediapipe==0.10.14

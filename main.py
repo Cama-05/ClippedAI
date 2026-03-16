@@ -7,9 +7,19 @@ import re
 import subprocess
 import sys
 import string
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+# Keep noisy third-party libraries quiet before they are imported.
+os.environ['PYANNOTE_SUPPRESS_TORCHCODEC_WARNING'] = '1'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GLOG_minloglevel'] = '2'
+
+# Must be set before importing torch, otherwise the warning is emitted too early.
+warnings.filterwarnings("ignore", message="The pynvml package is deprecated")
+warnings.filterwarnings("ignore", message=r".*torchcodec is not installed correctly.*")
 
 import torch
 try:
@@ -24,11 +34,12 @@ from clipsai.clip.clip import Clip
 from dotenv import load_dotenv
 
 # Suppress unnecessary warnings
-import warnings
 warnings.filterwarnings("ignore", message="Model was trained with pyannote.audio")
 warnings.filterwarnings("ignore", message="Model was trained with torch")
 warnings.filterwarnings("ignore", message="Lightning automatically upgraded")
 warnings.filterwarnings("ignore", message="SymbolDatabase.GetPrototype() is deprecated")
+warnings.filterwarnings("ignore", message="The pynvml package is deprecated")
+warnings.filterwarnings("ignore", message="torchcodec is not installed correctly")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
 warnings.filterwarnings("ignore", message="torchaudio._backend.list_audio_backends has been deprecated")
@@ -40,9 +51,15 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 # Load environment variables
 load_dotenv()
 
-# Download required NLTK data
-nltk.download('punkt')
-nltk.download('punkt_tab')
+# Download required NLTK data only if missing (avoids repeated startup overhead)
+def ensure_nltk_resource(resource_path: str, package_name: str) -> None:
+    try:
+        nltk.data.find(resource_path)
+    except LookupError:
+        nltk.download(package_name, quiet=True)
+
+ensure_nltk_resource('tokenizers/punkt', 'punkt')
+ensure_nltk_resource('tokenizers/punkt_tab', 'punkt_tab')
 
 # --- Directories ---
 INPUT_DIR = "input"
@@ -62,6 +79,7 @@ TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "large-v1")
 # --- Resizing ---
 ASPECT_RATIO_WIDTH = int(os.getenv("ASPECT_RATIO_WIDTH", "9"))
 ASPECT_RATIO_HEIGHT = int(os.getenv("ASPECT_RATIO_HEIGHT", "16"))
+ENABLE_PYANNOTE_RESIZE = os.getenv("ENABLE_PYANNOTE_RESIZE", "false").strip().lower() == "true"
 
 # --- Groq API ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
@@ -248,6 +266,28 @@ def convert_to_vertical_ffmpeg(input_path: str, output_path: str) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f'FFmpeg 9:16 conversion failed:\n{result.stderr}')
+    return output_path
+
+
+def normalize_vertical_output_ffmpeg(input_path: str, output_path: str) -> str:
+    """Normalize an already-vertical clip to an exact 1080x1920 canvas."""
+    cmd = [
+        'ffmpeg',
+        '-i', input_path,
+        '-vf', 'scale=1080:1920:flags=lanczos,setsar=1',
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', '18',
+        '-r', '30',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        '-y',
+        output_path,
+    ]
+    print(f'Normalizing output to exact 1080x1920 -> {os.path.basename(output_path)}')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'FFmpeg normalization failed:\n{result.stderr}')
     return output_path
 
 
@@ -780,7 +820,6 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
     max_clips = video_max_clips[video_file]
 
     # 1. Transcribe the video (or use YouTube transcript, or load existing)
-    transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
 
     # Priority: YouTube transcript (if URL mode) > cached pkl > fresh Whisper
     if yt_transcription is not None and video_file == list(video_transcription_map.keys())[0]:
@@ -789,11 +828,13 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
     elif transcription_file:
         transcription = load_existing_transcription(transcription_path)
         if transcription is None:
+            transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
             transcription = transcribe_with_progress(input_path, transcriber)
             save_transcription(transcription, transcription_path)
     else:
         transcription = load_existing_transcription(transcription_path)
         if transcription is None:
+            transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
             transcription = transcribe_with_progress(input_path, transcriber)
             save_transcription(transcription, transcription_path)
 
@@ -864,6 +905,10 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
                     print(f'Trimmed clip {i+1}: {trimmed_clip.start_time:.1f}s - {trimmed_clip.end_time:.1f}s (duration: {trimmed_clip.end_time - trimmed_clip.start_time:.1f}s)')
 
     # Process each selected clip
+    pyannote_resize_available = ENABLE_PYANNOTE_RESIZE
+    if not pyannote_resize_available:
+        print('Pyannote resize disabled (ENABLE_PYANNOTE_RESIZE=false). Using FFmpeg 9:16 fallback for speed/stability.')
+
     for clip_index, clip in enumerate(selected_clips):
         print(f'\n--- Processing Clip {clip_index + 1}/{len(selected_clips)} ---')
         # 4. Trim the video to the selected clip
@@ -873,26 +918,30 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
         trim_video_ffmpeg(input_path, clip.start_time, clip.end_time, trimmed_path)
         # 5. Try to resize to 9:16 aspect ratio
         output_path = os.path.join(OUTPUT_DIR, f'yt_short_{clip_index + 1}.mp4')
-        try:
-            print('Resizing video to 9:16 aspect ratio...')
-            aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
-            aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
-            crops = resize(
-                video_file_path=trimmed_path,
-                pyannote_auth_token=HUGGINGFACE_TOKEN,
-                aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
-            )
-            resized_video_file = media_editor.resize_video(
-                original_video_file=AudioVideoFile(trimmed_path),
-                resized_video_file_path=output_path,
-                width=crops.crop_width,
-                height=crops.crop_height,
-                segments=crops.to_dict()["segments"],
-            )
-            print(f'YouTube Short (9:16) saved to {output_path}')
-        except Exception as e:
-            print(f'Resizing failed: {e}')
-            print('Falling back to FFmpeg vertical conversion (guaranteed 9:16)...')
+        if pyannote_resize_available:
+            try:
+                print('Resizing video to 9:16 aspect ratio with pyannote...')
+                aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
+                aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
+                crops = resize(
+                    video_file_path=trimmed_path,
+                    pyannote_auth_token=HUGGINGFACE_TOKEN,
+                    aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
+                )
+                resized_video_file = media_editor.resize_video(
+                    original_video_file=AudioVideoFile(trimmed_path),
+                    resized_video_file_path=output_path,
+                    width=crops.crop_width,
+                    height=crops.crop_height,
+                    segments=crops.to_dict()["segments"],
+                )
+                print(f'YouTube Short (9:16) saved to {output_path}')
+            except Exception as e:
+                print(f'Resizing with pyannote failed: {e}')
+                print('Switching to FFmpeg 9:16 fallback for remaining clips in this video...')
+                pyannote_resize_available = False
+                output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
+        else:
             output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
 
         # Validate output aspect ratio and enforce 9:16 if needed.
@@ -904,6 +953,12 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
                 print('Aspect ratio is not 9:16. Re-encoding with 9:16 fallback...')
                 fixed_output_path = output_path.replace('.mp4', '_9x16.mp4')
                 output_path = convert_to_vertical_ffmpeg(output_path, fixed_output_path)
+                width, height = get_video_dimensions(output_path)
+
+            if width != 1080 or height != 1920:
+                print('Output is vertical but not standard 1080x1920. Normalizing...')
+                normalized_output_path = output_path.replace('.mp4', '_1080x1920.mp4')
+                output_path = normalize_vertical_output_ffmpeg(output_path, normalized_output_path)
         except Exception as dim_err:
             print(f'Could not validate output dimensions: {dim_err}')
 
