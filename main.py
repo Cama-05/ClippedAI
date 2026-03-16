@@ -1,10 +1,13 @@
 """Main script to process videos and create YouTube Shorts using AI-powered transcription and clip detection."""
 
+import argparse
 import os
 import pickle
+import re
 import subprocess
 import sys
 import string
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -39,6 +42,7 @@ load_dotenv()
 
 # Download required NLTK data
 nltk.download('punkt')
+nltk.download('punkt_tab')
 
 # --- Directories ---
 INPUT_DIR = "input"
@@ -271,7 +275,7 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
     print("NOTE: Ensure 'Montserrat Extra Bold' font is installed or is available in the fonts directory.")
 
     # Write ASS subtitle file with clean, bold styling at the TOP CENTER
-    ass_file = os.path.join(OUTPUT_DIR, 'temp_subtitles.ass')
+    ass_file = os.path.abspath(os.path.join(OUTPUT_DIR, 'temp_subtitles.ass')).replace('\\', '/')
     with open(ass_file, 'w', encoding='utf-8') as f:
         f.write("""[Script Info]
 ScriptType: v4.00+
@@ -308,7 +312,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     final_output = output_path.replace('.mp4', '_with_subtitles.mp4')
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_path,
-        '-vf', f"ass={ass_file}",
+        '-vf', f"ass='{ass_file}'",
         '-c:a', 'copy',
         '-y',
         final_output
@@ -372,6 +376,154 @@ def get_viral_title(transcript_text, groq_api_key):
         print(f"Unexpected error with Groq API: {e}")
         return "Untitled Clip"
 
+def download_youtube_video(url: str, output_dir: str = "input") -> str:
+    """
+    Download a YouTube video at 1080p quality using yt-dlp.
+    Returns the path to the downloaded .mp4 file.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
+
+    # Download best 1080p video merged with best audio into mp4
+    # --restrict-filenames keeps the filename ASCII-only (avoids libmagic UnicodeDecodeError on Windows)
+    cmd = [
+        "yt-dlp",
+        "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--restrict-filenames",
+        "--output", output_template,
+        "--print", "after_move:filepath",
+        url,
+    ]
+    print(f"Downloading YouTube video at 1080p: {url}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
+
+    # The last printed line is the final filepath
+    filepath = result.stdout.strip().splitlines()[-1].strip()
+    if not filepath or not os.path.exists(filepath):
+        # Fallback: find newest mp4 in output_dir
+        mp4s = sorted(Path(output_dir).glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not mp4s:
+            raise FileNotFoundError("yt-dlp completed but no mp4 found in input/")
+        filepath = str(mp4s[0])
+
+    print(f"Video downloaded: {filepath}")
+    return filepath
+
+
+def get_youtube_transcript(url: str):
+    """
+    Fetch the YouTube transcript for the given URL using youtube-transcript-api.
+    Returns a list of segment dicts with keys: text, start, duration.
+    Prefers manual transcripts over auto-generated ones.
+    """
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    match = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    if not match:
+        raise ValueError(f"Cannot extract video ID from URL: {url}")
+    video_id = match.group(1)
+
+    api = YouTubeTranscriptApi()
+    transcript_list = api.list(video_id)
+    all_transcripts = list(transcript_list)
+
+    if not all_transcripts:
+        raise RuntimeError("No transcripts available for this video.")
+
+    manual = [t for t in all_transcripts if not t.is_generated]
+    generated = [t for t in all_transcripts if t.is_generated]
+    chosen = (manual or generated)[0]
+
+    label = "manual" if not chosen.is_generated else "auto-generated"
+    print(f"YouTube transcript: {chosen.language} ({chosen.language_code}) — {label}")
+
+    raw = chosen.fetch()
+    segments = []
+    for entry in raw:
+        # Support both dict-style (API <0.6) and object-style (API >=0.6)
+        try:
+            start = float(entry["start"])
+            duration = float(entry.get("duration", 0.0))
+            text = entry["text"]
+        except (TypeError, KeyError):
+            start = float(entry.start)
+            duration = float(getattr(entry, "duration", 0.0))
+            text = entry.text
+        segments.append({"start": start, "duration": duration, "text": text.strip()})
+
+    language_code = chosen.language_code
+    return segments, language_code
+
+
+def youtube_transcript_to_clipsai(segments: list, language_code: str):
+    """
+    Convert YouTube transcript segments (phrase-level) to a clipsai Transcription object.
+    Timestamps are distributed across characters proportionally within each segment,
+    giving word-level precision sufficient for ClipFinder.
+    """
+    from clipsai.transcribe.transcription import Transcription
+
+    char_info = []
+
+    for seg in segments:
+        seg_start = seg["start"]
+        seg_duration = seg["duration"] if seg["duration"] > 0 else 0.5
+        seg_end = seg_start + seg_duration
+        raw_text = seg["text"] + " "  # trailing space as word separator
+
+        words = raw_text.split(" ")
+        words = [w for w in words if w]  # drop empty strings
+
+        if not words:
+            continue
+
+        # Distribute segment time proportionally by character count
+        total_chars = sum(len(w) for w in words)
+        if total_chars == 0:
+            continue
+
+        cursor = seg_start
+        for word in words:
+            if not word:
+                continue
+            word_duration = seg_duration * (len(word) / total_chars)
+            word_end = cursor + word_duration
+
+            for i, ch in enumerate(word):
+                char_start = cursor + word_duration * (i / len(word))
+                char_end = cursor + word_duration * ((i + 1) / len(word))
+                char_info.append({
+                    "char": ch,
+                    "start_time": round(char_start, 4),
+                    "end_time": round(char_end, 4),
+                    "speaker": None,
+                })
+            # Add a space character between words
+            char_info.append({
+                "char": " ",
+                "start_time": round(word_end, 4),
+                "end_time": round(word_end, 4),
+                "speaker": None,
+            })
+            cursor = word_end
+
+    if not char_info:
+        raise RuntimeError("YouTube transcript produced no character data.")
+
+    transcription_dict = {
+        "source_software": "youtube-transcript-api",
+        "time_created": datetime.now(),
+        "language": language_code,
+        "num_speakers": None,
+        "char_info": char_info,
+    }
+    return Transcription(transcription_dict)
+
+
 def calculate_engagement_score(clip, transcription):
     """
     Calculate a custom engagement score for a clip based on available data.
@@ -408,54 +560,54 @@ def calculate_engagement_score(clip, transcription):
     
     return engagement_score
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+_parser = argparse.ArgumentParser(
+    description="ClippedAI – generate YouTube Shorts from a local video or a YouTube URL."
+)
+_parser.add_argument(
+    "--url",
+    metavar="YOUTUBE_URL",
+    default=None,
+    help="YouTube video URL to download (1080p) and process instead of files in input/",
+)
+_args = _parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Build video→transcription map
+# ---------------------------------------------------------------------------
+
 # Find all mp4 files in the input directory
 input_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('.mp4')]
-if not input_files:
-    raise FileNotFoundError('No mp4 file found in input directory.')
 
-# Find all transcription files in the input directory
-transcription_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('_transcription.pkl')]
+# If a YouTube URL is provided, download the video and fetch the transcript
+if _args.url:
+    print("\n=== YouTube URL mode ===")
+    downloaded_path = download_youtube_video(_args.url, INPUT_DIR)
+    downloaded_filename = os.path.basename(downloaded_path)
 
-# If more than one mp4, ask user to match transcription files (if any)
-video_transcription_map = {}
-if len(input_files) > 1:
-    print("Multiple video files detected:")
-    for idx, f in enumerate(input_files, 1):
-        print(f"  {idx}) {f}")
-    print("\nAvailable transcription files:")
-    for idx, f in enumerate(transcription_files, 1):
-        print(f"  {idx}) {f}")
-    print("\nFor each video, enter the number of the matching transcription file, or 0 to transcribe from scratch.")
-    for vid_idx, video_file in enumerate(input_files, 1):
-        while True:
-            try:
-                match = input(f"Match transcription for '{video_file}' (0 for none): ").strip().replace('\n', '')
-                match_idx = int(match)
-                if match_idx == 0:
-                    video_transcription_map[video_file] = None
-                    break
-                elif 1 <= match_idx <= len(transcription_files):
-                    video_transcription_map[video_file] = transcription_files[match_idx-1]
-                    break
-                else:
-                    print("Invalid choice. Try again.")
-            except Exception:
-                print("Invalid input. Try again.")
-else:
-    # Only one video, try to auto-match
-    video_file = input_files[0]
-    base_name = os.path.splitext(os.path.basename(video_file))[0]
-    expected_trans = f"{base_name}_transcription.pkl"
-    if expected_trans in transcription_files:
-        video_transcription_map[video_file] = expected_trans
-    else:
-        video_transcription_map[video_file] = None
+    # Try to get the YouTube transcript; fall back to whisper transcription if unavailable
+    yt_transcription = None
+    try:
+        yt_segments, yt_lang = get_youtube_transcript(_args.url)
+        print(f"Converting YouTube transcript ({len(yt_segments)} segments) to clipsai format...")
+        yt_transcription = youtube_transcript_to_clipsai(yt_segments, yt_lang)
+        print("YouTube transcript converted successfully.")
+    except Exception as yt_err:
+        print(f"YouTube transcript unavailable ({yt_err}). Will use Whisper transcription instead.")
 
-# Prompt user for number of clips for each video BEFORE any processing
-video_max_clips = {}
-clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
-for video_file in video_transcription_map:
-    print(f"\nHow many clips do you want for '{video_file}'?")
+    # Prepend downloaded video to the file list (deduplicate if already there)
+    if downloaded_filename not in input_files:
+        input_files.insert(0, downloaded_filename)
+
+    # Pre-populate transcription map for this video
+    video_transcription_map = {downloaded_filename: None}
+
+    # Prompt number of clips for the downloaded video only
+    video_max_clips = {}
+    clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
+    print(f"\nHow many clips do you want for '{downloaded_filename}'?")
     for i, (low, high) in enumerate(clip_ranges, 1):
         print(f"  {i}) {low}-{high}")
     try:
@@ -465,23 +617,96 @@ for video_file in video_transcription_map:
     except Exception:
         print("Invalid input. Defaulting to 2 clips.")
         user_choice = 1
-    max_clips = clip_ranges[user_choice-1][1]
-    print(f"Will select up to {max_clips} clips (if available and engaging).\n")
-    video_max_clips[video_file] = max_clips
+    video_max_clips[downloaded_filename] = clip_ranges[user_choice - 1][1]
 
+else:
+    yt_transcription = None
+
+    if not input_files:
+        raise FileNotFoundError('No mp4 file found in input directory.')
+
+    # Find all transcription files in the input directory
+    transcription_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('_transcription.pkl')]
+
+    # If more than one mp4, ask user to match transcription files (if any)
+    video_transcription_map = {}
+    if len(input_files) > 1:
+        print("Multiple video files detected:")
+        for idx, f in enumerate(input_files, 1):
+            print(f"  {idx}) {f}")
+        print("\nAvailable transcription files:")
+        for idx, f in enumerate(transcription_files, 1):
+            print(f"  {idx}) {f}")
+        print("\nFor each video, enter the number of the matching transcription file, or 0 to transcribe from scratch.")
+        for vid_idx, video_file in enumerate(input_files, 1):
+            while True:
+                try:
+                    match = input(f"Match transcription for '{video_file}' (0 for none): ").strip().replace('\n', '')
+                    match_idx = int(match)
+                    if match_idx == 0:
+                        video_transcription_map[video_file] = None
+                        break
+                    elif 1 <= match_idx <= len(transcription_files):
+                        video_transcription_map[video_file] = transcription_files[match_idx-1]
+                        break
+                    else:
+                        print("Invalid choice. Try again.")
+                except Exception:
+                    print("Invalid input. Try again.")
+    else:
+        # Only one video, try to auto-match
+        video_file = input_files[0]
+        base_name = os.path.splitext(os.path.basename(video_file))[0]
+        expected_trans = f"{base_name}_transcription.pkl"
+        if expected_trans in transcription_files:
+            video_transcription_map[video_file] = expected_trans
+        else:
+            video_transcription_map[video_file] = None
+
+    # Prompt user for number of clips for each video BEFORE any processing
+    video_max_clips = {}
+    clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
+    for video_file in video_transcription_map:
+        print(f"\nHow many clips do you want for '{video_file}'?")
+        for i, (low, high) in enumerate(clip_ranges, 1):
+            print(f"  {i}) {low}-{high}")
+        try:
+            user_choice = int(input("Your choice: ").strip().replace('\n', ''))
+            if not (1 <= user_choice <= len(clip_ranges)):
+                raise ValueError
+        except Exception:
+            print("Invalid input. Defaulting to 2 clips.")
+            user_choice = 1
+        max_clips = clip_ranges[user_choice-1][1]
+        print(f"Will select up to {max_clips} clips (if available and engaging).\n")
+        video_max_clips[video_file] = max_clips
+
+# ---------------------------------------------------------------------------
 # Process each video file
+# ---------------------------------------------------------------------------
 for video_idx, (video_file, transcription_file) in enumerate(video_transcription_map.items(), 1):
     print(f"\n=== Processing Video {video_idx}/{len(video_transcription_map)}: {video_file} ===")
     input_path = os.path.abspath(os.path.join(INPUT_DIR, video_file))
     transcription_path = os.path.join(INPUT_DIR, transcription_file) if transcription_file else get_transcription_file_path(input_path)
     max_clips = video_max_clips[video_file]
 
-    # 1. Transcribe the video (or load existing)
+    # 1. Transcribe the video (or use YouTube transcript, or load existing)
     transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
-    transcription = load_existing_transcription(transcription_path) if transcription_file else None
-    if transcription is None:
-        transcription = transcribe_with_progress(input_path, transcriber)
-        save_transcription(transcription, transcription_path)
+
+    # Priority: YouTube transcript (if URL mode) > cached pkl > fresh Whisper
+    if yt_transcription is not None and video_file == list(video_transcription_map.keys())[0]:
+        transcription = yt_transcription
+        print("Using YouTube transcript (skipping Whisper transcription).")
+    elif transcription_file:
+        transcription = load_existing_transcription(transcription_path)
+        if transcription is None:
+            transcription = transcribe_with_progress(input_path, transcriber)
+            save_transcription(transcription, transcription_path)
+    else:
+        transcription = load_existing_transcription(transcription_path)
+        if transcription is None:
+            transcription = transcribe_with_progress(input_path, transcriber)
+            save_transcription(transcription, transcription_path)
 
     # 2. Find clips
     clipfinder = ClipFinder()
