@@ -263,9 +263,20 @@ All key settings can now be configured through the `.env` file:
 | `TRANSCRIPTION_MODEL` | medium | Whisper model to use (tiny, base, small, medium, large-v1, large-v2) |
 | `ASPECT_RATIO_WIDTH` | 9 | Width for aspect ratio (used with height for video resizing) |
 | `ASPECT_RATIO_HEIGHT` | 16 | Height for aspect ratio (used with width for video resizing) |
+| `ENABLE_GPU_VIDEO_EDITING` | true | Try to use FFmpeg `h264_nvenc` for GPU video encoding; auto-fallback to CPU `libx264` if unavailable |
 | `LOGO_OPACITY` | 0.55 | Logo transparency from `0.0` to `1.0` |
 | `LOGO_WIDTH_RATIO` | 0.50 | Logo width relative to the video width (0.50 = 540px on 1080x1920 output) |
 | `LOGO_EDGE_MARGIN` | 70 | Edge distance in pixels used for `top-center` and `bottom-center` logo positions |
+
+### GPU Video Editing (RTX / NVENC)
+
+ClippedAI can use your NVIDIA GPU for FFmpeg video encoding steps (trim/resize/normalize/logo overlay) through `h264_nvenc`.
+
+- Set `ENABLE_GPU_VIDEO_EDITING=true` in `.env`
+- Ensure your FFmpeg build includes NVENC support
+- If NVENC is not available, the script falls back automatically to CPU (`libx264`)
+
+At startup, the script prints the selected encoder so you can confirm whether GPU is active.
 
 ### Logo Overlay
 

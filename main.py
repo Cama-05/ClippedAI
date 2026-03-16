@@ -13,6 +13,7 @@ import tempfile
 import unicodedata
 from urllib.parse import urlparse
 import warnings
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -86,6 +87,7 @@ TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "large-v1")
 ASPECT_RATIO_WIDTH = int(os.getenv("ASPECT_RATIO_WIDTH", "9"))
 ASPECT_RATIO_HEIGHT = int(os.getenv("ASPECT_RATIO_HEIGHT", "16"))
 ENABLE_PYANNOTE_RESIZE = os.getenv("ENABLE_PYANNOTE_RESIZE", "false").strip().lower() == "true"
+ENABLE_GPU_VIDEO_EDITING = os.getenv("ENABLE_GPU_VIDEO_EDITING", "true").strip().lower() == "true"
 
 # --- Groq API ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
@@ -240,6 +242,52 @@ def get_font_path(font_name: str) -> str:
     # If not found with extension, return as is (for system fonts)
     return os.path.join("fonts", font_name)
 
+
+@lru_cache(maxsize=1)
+def can_use_nvenc() -> bool:
+    """Return True when FFmpeg NVENC is available and GPU editing is enabled."""
+    if not ENABLE_GPU_VIDEO_EDITING:
+        return False
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-encoders'],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        return 'h264_nvenc' in result.stdout
+    except Exception:
+        return False
+
+
+def get_video_encoder_args() -> List[str]:
+    """Return FFmpeg video encoder args, preferring NVENC when available."""
+    if can_use_nvenc():
+        # p5 + vbr_hq + cq gives good quality/speed balance on RTX cards.
+        return [
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p5',
+            '-rc:v', 'vbr_hq',
+            '-cq:v', '19',
+            '-b:v', '0',
+            '-profile:v', 'high',
+            '-pix_fmt', 'yuv420p',
+        ]
+
+    # CPU fallback keeps previous quality-oriented defaults.
+    return [
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', '16',
+        '-profile:v', 'high',
+        '-pix_fmt', 'yuv420p',
+    ]
+
+
+def active_video_encoder_name() -> str:
+    return 'h264_nvenc' if can_use_nvenc() else 'libx264'
+
 def trim_video_ffmpeg(input_path: str, start_time: float, end_time: float, output_path: str) -> str:
     """
     Trim video using FFmpeg with full re-encode to fix A/V desync and VFR stuttering.
@@ -253,12 +301,8 @@ def trim_video_ffmpeg(input_path: str, start_time: float, end_time: float, outpu
         '-ss', f'{start_time:.3f}',   # fast keyframe seek before input
         '-i', input_path,
         '-t', f'{duration:.3f}',
-        '-c:v', 'libx264',
-        '-preset', 'slow',            # quality over speed (user preference)
-        '-crf', '16',                 # high quality for YouTube re-encode (lower = less double-encode loss)
-        '-profile:v', 'high',         # H.264 High profile: better quality per bit
+        *get_video_encoder_args(),
         '-level:v', '4.1',            # supports 1080p@30fps
-        '-pix_fmt', 'yuv420p',        # required for YouTube transcoder compatibility
         '-colorspace', 'bt709',       # correct HD color metadata
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
@@ -295,12 +339,8 @@ def convert_to_vertical_ffmpeg(input_path: str, output_path: str) -> str:
         '-filter_complex', filter_graph,
         '-map', '[v]',
         '-map', '0:a?',
-        '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '16',
-        '-profile:v', 'high',
+        *get_video_encoder_args(),
         '-level:v', '4.1',
-        '-pix_fmt', 'yuv420p',
         '-colorspace', 'bt709',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
@@ -325,12 +365,8 @@ def normalize_vertical_output_ffmpeg(input_path: str, output_path: str) -> str:
         'ffmpeg',
         '-i', input_path,
         '-vf', 'scale=1080:1920:flags=lanczos,setsar=1,format=yuv420p',
-        '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '16',
-        '-profile:v', 'high',
+        *get_video_encoder_args(),
         '-level:v', '4.1',
-        '-pix_fmt', 'yuv420p',
         '-colorspace', 'bt709',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
@@ -457,12 +493,8 @@ def apply_logo_overlay_ffmpeg(input_path: str, output_path: str, logo_path: str,
         '-filter_complex', filter_graph,
         '-map', '[v]',
         '-map', '0:a?',
-        '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '16',
-        '-profile:v', 'high',
+        *get_video_encoder_args(),
         '-level:v', '4.1',
-        '-pix_fmt', 'yuv420p',
         '-colorspace', 'bt709',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
@@ -608,12 +640,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_path,
         '-vf', f"ass=filename='{ass_filter_path}'",
-        '-c:v', 'libx264',
-        '-preset', 'slow',
-        '-crf', '16',
-        '-profile:v', 'high',
+        *get_video_encoder_args(),
         '-level:v', '4.1',
-        '-pix_fmt', 'yuv420p',
         '-colorspace', 'bt709',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
@@ -984,6 +1012,12 @@ _parser.add_argument(
 )
 _args = _parser.parse_args()
 logo_position = normalize_logo_position(_args.logo_position)
+print(
+    f"Video encoder selected: {active_video_encoder_name()} "
+    f"({'GPU' if can_use_nvenc() else 'CPU fallback'})"
+)
+if ENABLE_GPU_VIDEO_EDITING and not can_use_nvenc():
+    print("GPU video editing requested but NVENC is unavailable. Falling back to libx264.")
 
 # ---------------------------------------------------------------------------
 # Build video→transcription map
