@@ -186,6 +186,87 @@ def get_font_path(font_name: str) -> str:
     # If not found with extension, return as is (for system fonts)
     return os.path.join("fonts", font_name)
 
+def trim_video_ffmpeg(input_path: str, start_time: float, end_time: float, output_path: str) -> str:
+    """
+    Trim video using FFmpeg with full re-encode to fix A/V desync and VFR stuttering.
+    YouTube downloads are Variable Frame Rate (VFR); stream-copy trims preserve the
+    original timestamps causing progressive audio/video drift.  Re-encoding to a
+    constant 30 fps resets all timestamps and eliminates both issues.
+    """
+    duration = end_time - start_time
+    cmd = [
+        'ffmpeg',
+        '-ss', f'{start_time:.3f}',   # fast keyframe seek before input
+        '-i', input_path,
+        '-t', f'{duration:.3f}',
+        '-c:v', 'libx264',
+        '-preset', 'slow',            # quality over speed (user preference)
+        '-crf', '18',                 # high quality (0=lossless, 23=default)
+        '-r', '30',                   # force constant 30 fps → eliminates stuttering
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-avoid_negative_ts', 'make_zero',   # reset timestamps to 0
+        '-movflags', '+faststart',    # progressive web playback
+        '-y',
+        output_path
+    ]
+    print(f'Trimming clip ({start_time:.2f}s – {end_time:.2f}s) with re-encode → {os.path.basename(output_path)}')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'FFmpeg trim failed:\n{result.stderr}')
+    return output_path
+
+
+def convert_to_vertical_ffmpeg(input_path: str, output_path: str) -> str:
+    """
+    Force a true 9:16 output (1080x1920) without pyannote.
+    Uses a blurred background + centered foreground to preserve subject visibility.
+    """
+    filter_graph = (
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=20:10[bg];"
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]"
+    )
+    cmd = [
+        'ffmpeg',
+        '-i', input_path,
+        '-filter_complex', filter_graph,
+        '-map', '[v]',
+        '-map', '0:a?',
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', '18',
+        '-r', '30',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+        '-y',
+        output_path,
+    ]
+    print(f'Forcing 9:16 output with fallback conversion -> {os.path.basename(output_path)}')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'FFmpeg 9:16 conversion failed:\n{result.stderr}')
+    return output_path
+
+
+def get_video_dimensions(video_path: str) -> Tuple[int, int]:
+    """Return (width, height) for a video file using ffprobe."""
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height',
+        '-of', 'csv=p=0:s=x',
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'ffprobe failed:\n{result.stderr}')
+    width_str, height_str = result.stdout.strip().split('x')
+    return int(width_str), int(height_str)
+
 def transcribe_with_progress(audio_file_path, transcriber):
     """Transcribe with progress tracking"""
     print('Transcribing video...')
@@ -310,10 +391,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{line}\n")
     
     final_output = output_path.replace('.mp4', '_with_subtitles.mp4')
+    # Escape drive-letter colon for FFmpeg filter parser on Windows (e.g., C\:/...)
+    ass_filter_path = ass_file.replace(':', '\\:').replace("'", r"\'")
+
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_path,
-        '-vf', f"ass='{ass_file}'",
+        '-vf', f"ass=filename='{ass_filter_path}'",
+        '-c:v', 'libx264',
+        '-preset', 'slow',    # quality over speed
+        '-crf', '16',         # slightly tighter than trim (compensates for double-encode loss)
+        '-r', '30',           # enforce CFR in case resize produced VFR
         '-c:a', 'copy',
+        '-movflags', '+faststart',
         '-y',
         final_output
     ]
@@ -779,15 +868,9 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
         print(f'\n--- Processing Clip {clip_index + 1}/{len(selected_clips)} ---')
         # 4. Trim the video to the selected clip
         media_editor = MediaEditor()
-        media_file = AudioVideoFile(input_path)
         trimmed_path = os.path.join(OUTPUT_DIR, f'trimmed_clip_{clip_index + 1}.mp4')
         print('Trimming video to selected clip...')
-        trimmed_media_file = media_editor.trim(
-            media_file=media_file,
-            start_time=clip.start_time,
-            end_time=clip.end_time,
-            trimmed_media_file_path=trimmed_path
-        )
+        trim_video_ffmpeg(input_path, clip.start_time, clip.end_time, trimmed_path)
         # 5. Try to resize to 9:16 aspect ratio
         output_path = os.path.join(OUTPUT_DIR, f'yt_short_{clip_index + 1}.mp4')
         try:
@@ -809,8 +892,21 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
             print(f'YouTube Short (9:16) saved to {output_path}')
         except Exception as e:
             print(f'Resizing failed: {e}')
-            print('Saving trimmed clip without resizing...')
-            output_path = trimmed_path
+            print('Falling back to FFmpeg vertical conversion (guaranteed 9:16)...')
+            output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
+
+        # Validate output aspect ratio and enforce 9:16 if needed.
+        try:
+            width, height = get_video_dimensions(output_path)
+            ratio = width / height if height else 0
+            print(f'Output dimensions: {width}x{height} (ratio: {ratio:.4f})')
+            if abs(ratio - (9 / 16)) > 0.01:
+                print('Aspect ratio is not 9:16. Re-encoding with 9:16 fallback...')
+                fixed_output_path = output_path.replace('.mp4', '_9x16.mp4')
+                output_path = convert_to_vertical_ffmpeg(output_path, fixed_output_path)
+        except Exception as dim_err:
+            print(f'Could not validate output dimensions: {dim_err}')
+
         # 6. Add styled subtitles
         final_output = create_animated_subtitles(output_path, transcription, clip, output_path)
         # 7. Generate viral title using Groq API
