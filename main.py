@@ -1,12 +1,17 @@
 """Main script to process videos and create YouTube Shorts using AI-powered transcription and clip detection."""
 
+import atexit
 import argparse
+import csv
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
-import string
+import tempfile
+import unicodedata
+from urllib.parse import urlparse
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -64,7 +69,8 @@ ensure_nltk_resource('tokenizers/punkt_tab', 'punkt_tab')
 # --- Directories ---
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
-FONT_DIR = "fonts" 
+FONT_DIR = "fonts"
+METADATA_CSV_PATH = os.getenv("METADATA_CSV_PATH", os.path.join(OUTPUT_DIR, "shorts_metadata.csv"))
 
 # --- Hugging Face ---
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "your_huggingface_token_here")
@@ -83,6 +89,17 @@ ENABLE_PYANNOTE_RESIZE = os.getenv("ENABLE_PYANNOTE_RESIZE", "false").strip().lo
 
 # --- Groq API ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# --- LLM Provider (metadata generation) ---
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").strip().lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your_openai_api_key_here")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# --- Logo Overlay ---
+LOGO_OPACITY = max(0.0, min(1.0, float(os.getenv("LOGO_OPACITY", "0.55"))))
+LOGO_WIDTH_RATIO = max(0.05, min(0.9, float(os.getenv("LOGO_WIDTH_RATIO", "0.50"))))
+LOGO_EDGE_MARGIN = max(0, int(os.getenv("LOGO_EDGE_MARGIN", os.getenv("LOGO_MARGIN_TOP", "70"))))
 
 # --- Subtitles ---
 SUBTITLE_FONT = "Montserrat Extra Bold"
@@ -177,21 +194,40 @@ def ass_time(seconds: float) -> str:
     return f"{hours:d}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
 def safe_filename(s: str) -> str:
-    """Remove characters not allowed in filenames, but keep spaces, punctuation, and emojis."""
-    # Define a set of characters that are generally safe for filenames
-    # This includes alphanumeric, spaces, and some common punctuation
-    safe_chars = string.ascii_letters + string.digits + " -_."
-    # Add common punctuation that might be part of a title but needs careful handling
-    safe_chars += "!?,:;@#$%^&+=[]{}"
-    # Add a range of common emojis. This list can be expanded if needed.
-    # Using a broad range to cover most common emojis without making the string excessively long.
-    emoji_chars = "".join(chr(i) for i in range(0x1F600, 0x1F64F)) + \
-                  "".join(chr(i) for i in range(0x1F300, 0x1F5FF)) + \
-                  "".join(chr(i) for i in range(0x1F900, 0x1F9FF)) + \
-                  "".join(chr(i) for i in range(0x1FA70, 0x1FAFF))
-    
-    valid_chars = safe_chars + emoji_chars
-    return ''.join(c for c in s if c in valid_chars)
+    """Sanitize filename for Windows while preserving readable Unicode (including emojis)."""
+    # Normalize composed/decomposed Unicode sequences to stable code points.
+    s = unicodedata.normalize("NFKC", s)
+
+    forbidden = '<>:"/\\|?*'
+    cleaned_chars = []
+    for ch in s:
+        code = ord(ch)
+        if code < 32:
+            continue
+        if ch in forbidden:
+            cleaned_chars.append('_')
+            continue
+        # Drop variation selectors (for example U+FE0F), often invisible in filenames.
+        if 0xFE00 <= code <= 0xFE0F:
+            continue
+        cleaned_chars.append(ch)
+
+    name = ''.join(cleaned_chars)
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = re.sub(r'_+', '_', name).strip(' .')
+
+    reserved = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }
+
+    if not name:
+        return "clip"
+    if name.upper() in reserved:
+        name = f"{name}_file"
+
+    return name[:150]
 
 
 def get_font_path(font_name: str) -> str:
@@ -219,10 +255,17 @@ def trim_video_ffmpeg(input_path: str, start_time: float, end_time: float, outpu
         '-t', f'{duration:.3f}',
         '-c:v', 'libx264',
         '-preset', 'slow',            # quality over speed (user preference)
-        '-crf', '18',                 # high quality (0=lossless, 23=default)
+        '-crf', '16',                 # high quality for YouTube re-encode (lower = less double-encode loss)
+        '-profile:v', 'high',         # H.264 High profile: better quality per bit
+        '-level:v', '4.1',            # supports 1080p@30fps
+        '-pix_fmt', 'yuv420p',        # required for YouTube transcoder compatibility
+        '-colorspace', 'bt709',       # correct HD color metadata
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
         '-r', '30',                   # force constant 30 fps → eliminates stuttering
         '-c:a', 'aac',
-        '-b:a', '192k',
+        '-b:a', '256k',               # higher audio quality
+        '-ar', '48000',               # 48 kHz — YouTube standard sample rate
         '-avoid_negative_ts', 'make_zero',   # reset timestamps to 0
         '-movflags', '+faststart',    # progressive web playback
         '-y',
@@ -254,10 +297,17 @@ def convert_to_vertical_ffmpeg(input_path: str, output_path: str) -> str:
         '-map', '0:a?',
         '-c:v', 'libx264',
         '-preset', 'slow',
-        '-crf', '18',
+        '-crf', '16',
+        '-profile:v', 'high',
+        '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p',
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
         '-r', '30',
         '-c:a', 'aac',
-        '-b:a', '192k',
+        '-b:a', '256k',
+        '-ar', '48000',
         '-movflags', '+faststart',
         '-y',
         output_path,
@@ -274,10 +324,16 @@ def normalize_vertical_output_ffmpeg(input_path: str, output_path: str) -> str:
     cmd = [
         'ffmpeg',
         '-i', input_path,
-        '-vf', 'scale=1080:1920:flags=lanczos,setsar=1',
+        '-vf', 'scale=1080:1920:flags=lanczos,setsar=1,format=yuv420p',
         '-c:v', 'libx264',
         '-preset', 'slow',
-        '-crf', '18',
+        '-crf', '16',
+        '-profile:v', 'high',
+        '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p',
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
         '-r', '30',
         '-c:a', 'copy',
         '-movflags', '+faststart',
@@ -306,6 +362,121 @@ def get_video_dimensions(video_path: str) -> Tuple[int, int]:
         raise RuntimeError(f'ffprobe failed:\n{result.stderr}')
     width_str, height_str = result.stdout.strip().split('x')
     return int(width_str), int(height_str)
+
+
+def get_video_fps(video_path: str) -> float:
+    """Return FPS for the first video stream using ffprobe."""
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=avg_frame_rate',
+        '-of', 'default=nokey=1:noprint_wrappers=1',
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'ffprobe failed while reading fps:\n{result.stderr}')
+
+    rate = result.stdout.strip()
+    if not rate or rate == '0/0':
+        return 0.0
+    if '/' in rate:
+        num_str, den_str = rate.split('/', 1)
+        den = float(den_str)
+        if den == 0:
+            return 0.0
+        return float(num_str) / den
+    return float(rate)
+
+
+def download_logo_from_url(logo_url: str, download_dir: str) -> str:
+    """Download a remote logo asset to a local temporary path for FFmpeg."""
+    import requests
+
+    parsed = urlparse(logo_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported logo URL scheme: {parsed.scheme or 'missing'}")
+
+    raw_name = os.path.basename(parsed.path) or "logo.png"
+    suffix = os.path.splitext(raw_name)[1].lower()
+    if suffix not in {".png", ".webp", ".jpg", ".jpeg"}:
+        suffix = ".png"
+
+    os.makedirs(download_dir, exist_ok=True)
+    local_logo_path = os.path.join(download_dir, f"logo_asset{suffix}")
+
+    response = requests.get(logo_url, timeout=60)
+    response.raise_for_status()
+    with open(local_logo_path, 'wb') as logo_file:
+        logo_file.write(response.content)
+
+    return local_logo_path
+
+
+def normalize_logo_position(raw_position: str) -> str:
+    """Normalize CLI logo position values, supporting English and Italian labels."""
+    normalized = (raw_position or "").strip().lower()
+    aliases = {
+        "center": "center",
+        "centro": "center",
+        "top-center": "top-center",
+        "center-top": "top-center",
+        "centro-alto": "top-center",
+        "bottom-center": "bottom-center",
+        "center-bottom": "bottom-center",
+        "centro-basso": "bottom-center",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Invalid --logo-position '{raw_position}'. "
+            "Use one of: center, top-center, bottom-center "
+            "(or: centro, centro-alto, centro-basso)."
+        )
+    return aliases[normalized]
+
+
+def apply_logo_overlay_ffmpeg(input_path: str, output_path: str, logo_path: str, logo_position: str) -> str:
+    """Overlay a semi-transparent logo at the requested screen position."""
+    if logo_position == "top-center":
+        overlay_y = str(LOGO_EDGE_MARGIN)
+    elif logo_position == "bottom-center":
+        overlay_y = f"main_h-overlay_h-{LOGO_EDGE_MARGIN}"
+    else:
+        overlay_y = "(main_h-overlay_h)/2"
+
+    filter_graph = (
+        f"[1:v][0:v]scale2ref=w=main_w*{LOGO_WIDTH_RATIO:.4f}:h=ow/mdar[logo][base];"
+        f"[logo]format=rgba,colorchannelmixer=aa={LOGO_OPACITY:.3f}[logo_alpha];"
+        f"[base][logo_alpha]overlay=(main_w-overlay_w)/2:{overlay_y}:format=auto[v]"
+    )
+    cmd = [
+        'ffmpeg',
+        '-i', input_path,
+        '-i', logo_path,
+        '-filter_complex', filter_graph,
+        '-map', '[v]',
+        '-map', '0:a?',
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', '16',
+        '-profile:v', 'high',
+        '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p',
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-r', '30',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        '-y',
+        output_path,
+    ]
+    print(f"Applying logo overlay from: {logo_path}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f'FFmpeg logo overlay failed:\n{result.stderr}')
+    return output_path
 
 def transcribe_with_progress(audio_file_path, transcriber):
     """Transcribe with progress tracking"""
@@ -438,9 +609,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         'ffmpeg', '-i', video_path,
         '-vf', f"ass=filename='{ass_filter_path}'",
         '-c:v', 'libx264',
-        '-preset', 'slow',    # quality over speed
-        '-crf', '16',         # slightly tighter than trim (compensates for double-encode loss)
-        '-r', '30',           # enforce CFR in case resize produced VFR
+        '-preset', 'slow',
+        '-crf', '16',
+        '-profile:v', 'high',
+        '-level:v', '4.1',
+        '-pix_fmt', 'yuv420p',
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-r', '30',
         '-c:a', 'copy',
         '-movflags', '+faststart',
         '-y',
@@ -457,87 +634,176 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         print(f'FFmpeg stdout: {e.stdout.decode()}')
         return video_path
 
-def get_viral_title(transcript_text, groq_api_key):
+def get_viral_metadata(transcript_text: str) -> Tuple[str, str, str]:
     import requests
-    # Limit examples to avoid too long prompt
-    examples = [
-        "She was almost dead 😵", "He made $1,000,000 in 1 hour 💸", "This changed everything... 😲", 
-        "They couldn't believe what happened! 😱", "He risked it all for this 😬"
-    ]
+
     prompt = (
-        "Given the following transcript, generate a catchy, viral YouTube Shorts title (max 7 words). "
-        "ALWAYS include an emoji in the title. ONLY output the title, nothing else. Do NOT use hashtags. "
-        "Do NOT explain, do NOT repeat the prompt, do NOT add quotes. The title should be in the style of these examples: "
-        + ", ".join(examples) + ".\n\nTranscript:\n" + transcript_text
+        "You are generating metadata for short-form video platforms (YouTube Shorts, TikTok, Reels).\n"
+        "Given the transcript, output EXACTLY 3 lines in this format:\n"
+        "TITLE: <max 7 words, can include 1 emoji, no hashtags>\n"
+        "DESCRIPTION: <1 short engaging sentence, max 140 chars,can include up to 2 hashtags>\n"
+        "TAGS: <8-12 comma-separated tags, no # symbol>\n"
+        "Do not output anything else.\n\n"
+        f"Transcript:\n{transcript_text}"
     )
-    headers = {
-        'Authorization': f'Bearer {groq_api_key}',
-        'Content-Type': 'application/json',
-    }
-    data = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 30,
-        "temperature": 0.7,
-        "top_p": 0.9
-    }
+
+    default_title = "Untitled Clip"
+    default_description = "Short highlight clip generated by ClippedAI."
+    default_tags = "shorts,viral,clip,content,highlights"
+
+    provider = LLM_PROVIDER if LLM_PROVIDER in {"groq", "openai"} else "groq"
+    if provider != LLM_PROVIDER:
+        print(f"Invalid LLM_PROVIDER '{LLM_PROVIDER}'. Falling back to 'groq'.")
+
+    if provider == "openai":
+        api_key = OPENAI_API_KEY
+        model = OPENAI_MODEL
+        url = "https://api.openai.com/v1/chat/completions"
+        provider_label = "OpenAI"
+    else:
+        api_key = GROQ_API_KEY
+        model = GROQ_MODEL
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        provider_label = "Groq"
+
+    if not api_key or api_key.startswith("your_"):
+        print(f"{provider_label} API key not configured. Using default metadata.")
+        return default_title, default_description, default_tags
+
     try:
+        print(f"Generating metadata via {provider_label} ({model})...")
+
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
         response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+            url,
             headers=headers,
-            json=data
+            json=data,
         )
         response.raise_for_status()
         result = response.json()
-        # Just return the first line of the response as the title, and filter out any lines that look like explanations or quotes
         content = result['choices'][0]['message']['content']
-        lines = [l.strip('"') for l in content.strip().split('\n') if l.strip() and not l.lower().startswith('here') and not l.lower().startswith('title:')]
-        title = lines[0] if lines else "Untitled Clip"
-        return title
+
+        title_match = re.search(r"^TITLE:\s*(.+)$", content, flags=re.IGNORECASE | re.MULTILINE)
+        description_match = re.search(r"^DESCRIPTION:\s*(.+)$", content, flags=re.IGNORECASE | re.MULTILINE)
+        tags_match = re.search(r"^TAGS:\s*(.+)$", content, flags=re.IGNORECASE | re.MULTILINE)
+
+        title = title_match.group(1).strip().strip('"') if title_match else default_title
+        description = description_match.group(1).strip().strip('"') if description_match else default_description
+        tags = tags_match.group(1).strip().strip('"') if tags_match else default_tags
+
+        if not title:
+            title = default_title
+        if not description:
+            description = default_description
+        if not tags:
+            tags = default_tags
+
+        # Normalize tags as comma-separated values without leading '#'.
+        normalized_tags = []
+        for raw_tag in tags.split(','):
+            tag = raw_tag.strip().lstrip('#')
+            if tag:
+                normalized_tags.append(tag)
+        tags = ", ".join(normalized_tags) if normalized_tags else default_tags
+
+        return title[:120], description[:160], tags[:500]
     except requests.exceptions.HTTPError as e:
-        print(f"Error with Groq API: {e}")
+        print(f"Error with {provider_label} API: {e}")
         print(f"Response status code: {response.status_code}")
         print(f"Response text: {response.text}")
-        return "Untitled Clip"
+        return default_title, default_description, default_tags
     except Exception as e:
-        print(f"Unexpected error with Groq API: {e}")
-        return "Untitled Clip"
+        print(f"Unexpected error with {provider_label} API: {e}")
+        return default_title, default_description, default_tags
+
+
+def append_clip_metadata_csv(csv_path: str, row: Dict[str, str]) -> None:
+    """Append clip metadata to CSV, creating header on first write."""
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    fieldnames = [
+        "created_at",
+        "source_video",
+        "source_url",
+        "clip_index",
+        "clip_start_s",
+        "clip_end_s",
+        "clip_duration_s",
+        "clip_file",
+        "title",
+        "description",
+        "tags",
+    ]
+
+    needs_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 def download_youtube_video(url: str, output_dir: str = "input") -> str:
     """
-    Download a YouTube video at 1080p quality using yt-dlp.
+    Download a YouTube video prioritizing 1440p (~2K) at 30fps using yt-dlp,
+    with fallback to the best available format/resolution.
     Returns the path to the downloaded .mp4 file.
     """
     os.makedirs(output_dir, exist_ok=True)
     output_template = os.path.join(output_dir, "%(title)s.%(ext)s")
 
-    # Download best 1080p video merged with best audio into mp4
+    # Prefer 1440p (~2K) at <=30fps; fallback progressively to any available quality.
     # --restrict-filenames keeps the filename ASCII-only (avoids libmagic UnicodeDecodeError on Windows)
     cmd = [
         "yt-dlp",
-        "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
+        "--format", (
+            "bestvideo[height=1440][fps<=30][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height=1440][fps<=30]+bestaudio/"
+            "bestvideo[height<=1440][fps<=30][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1440][fps<=30]+bestaudio/"
+            "bestvideo[height<=1440]+bestaudio/"
+            "best[height<=1440]/"
+            "best"
+        ),
         "--merge-output-format", "mp4",
         "--no-playlist",
         "--restrict-filenames",
         "--output", output_template,
+        "--print", "before_dl:Selected source: %(width)sx%(height)s @ %(fps)s fps (format_id=%(format_id)s)",
         "--print", "after_move:filepath",
         url,
     ]
-    print(f"Downloading YouTube video at 1080p: {url}")
+    print(f"Downloading YouTube video (target: 1440p ~2K @<=30fps, with fallback): {url}")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
 
+    stdout_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    selected_source_line = next((line for line in stdout_lines if line.startswith("Selected source:")), None)
+    if selected_source_line:
+        print(selected_source_line)
+
     # The last printed line is the final filepath
-    filepath = result.stdout.strip().splitlines()[-1].strip()
+    filepath = stdout_lines[-1] if stdout_lines else ""
     if not filepath or not os.path.exists(filepath):
         # Fallback: find newest mp4 in output_dir
         mp4s = sorted(Path(output_dir).glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not mp4s:
             raise FileNotFoundError("yt-dlp completed but no mp4 found in input/")
         filepath = str(mp4s[0])
+
+    try:
+        width, height = get_video_dimensions(filepath)
+        fps = get_video_fps(filepath)
+        print(f"Downloaded source details: {width}x{height} @ {fps:.2f} fps")
+    except Exception as e:
+        print(f"Could not verify downloaded source details (resolution/fps): {e}")
 
     print(f"Video downloaded: {filepath}")
     return filepath
@@ -701,7 +967,23 @@ _parser.add_argument(
     default=None,
     help="YouTube video URL to download (1080p) and process instead of files in input/",
 )
+_parser.add_argument(
+    "--logo-url",
+    metavar="LOGO_URL",
+    default=None,
+    help="Remote logo image URL (for example S3 or CDN). If omitted, no logo overlay is applied.",
+)
+_parser.add_argument(
+    "--logo-position",
+    metavar="LOGO_POSITION",
+    default="center",
+    help=(
+        "Logo position: center, top-center, bottom-center "
+        "(or: centro, centro-alto, centro-basso). Default: center."
+    ),
+)
 _args = _parser.parse_args()
+logo_position = normalize_logo_position(_args.logo_position)
 
 # ---------------------------------------------------------------------------
 # Build video→transcription map
@@ -813,6 +1095,19 @@ else:
 # ---------------------------------------------------------------------------
 # Process each video file
 # ---------------------------------------------------------------------------
+resolved_logo_path = None
+if _args.logo_url:
+    logo_download_dir = tempfile.mkdtemp(prefix="clippedai_logo_")
+    atexit.register(shutil.rmtree, logo_download_dir, ignore_errors=True)
+    try:
+        resolved_logo_path = download_logo_from_url(_args.logo_url, logo_download_dir)
+        print(f"Logo overlay enabled from URL: {_args.logo_url}")
+        print(f"Logo position: {logo_position}")
+    except Exception as logo_download_err:
+        raise RuntimeError(f"Could not download logo from --logo-url: {logo_download_err}") from logo_download_err
+else:
+    print("Logo overlay disabled: --logo-url not provided.")
+
 for video_idx, (video_file, transcription_file) in enumerate(video_transcription_map.items(), 1):
     print(f"\n=== Processing Video {video_idx}/{len(video_transcription_map)}: {video_file} ===")
     input_path = os.path.abspath(os.path.join(INPUT_DIR, video_file))
@@ -911,69 +1206,116 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
 
     for clip_index, clip in enumerate(selected_clips):
         print(f'\n--- Processing Clip {clip_index + 1}/{len(selected_clips)} ---')
-        # 4. Trim the video to the selected clip
-        media_editor = MediaEditor()
-        trimmed_path = os.path.join(OUTPUT_DIR, f'trimmed_clip_{clip_index + 1}.mp4')
-        print('Trimming video to selected clip...')
-        trim_video_ffmpeg(input_path, clip.start_time, clip.end_time, trimmed_path)
-        # 5. Try to resize to 9:16 aspect ratio
-        output_path = os.path.join(OUTPUT_DIR, f'yt_short_{clip_index + 1}.mp4')
-        if pyannote_resize_available:
-            try:
-                print('Resizing video to 9:16 aspect ratio with pyannote...')
-                aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
-                aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
-                crops = resize(
-                    video_file_path=trimmed_path,
-                    pyannote_auth_token=HUGGINGFACE_TOKEN,
-                    aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
-                )
-                resized_video_file = media_editor.resize_video(
-                    original_video_file=AudioVideoFile(trimmed_path),
-                    resized_video_file_path=output_path,
-                    width=crops.crop_width,
-                    height=crops.crop_height,
-                    segments=crops.to_dict()["segments"],
-                )
-                print(f'YouTube Short (9:16) saved to {output_path}')
-            except Exception as e:
-                print(f'Resizing with pyannote failed: {e}')
-                print('Switching to FFmpeg 9:16 fallback for remaining clips in this video...')
-                pyannote_resize_available = False
-                output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
-        else:
-            output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
-
-        # Validate output aspect ratio and enforce 9:16 if needed.
+        temp_dir = tempfile.mkdtemp(prefix="clippedai_")
         try:
-            width, height = get_video_dimensions(output_path)
-            ratio = width / height if height else 0
-            print(f'Output dimensions: {width}x{height} (ratio: {ratio:.4f})')
-            if abs(ratio - (9 / 16)) > 0.01:
-                print('Aspect ratio is not 9:16. Re-encoding with 9:16 fallback...')
-                fixed_output_path = output_path.replace('.mp4', '_9x16.mp4')
-                output_path = convert_to_vertical_ffmpeg(output_path, fixed_output_path)
+            # 4. Trim the video to the selected clip
+            media_editor = MediaEditor()
+            trimmed_path = os.path.join(temp_dir, f'trimmed_clip_{clip_index + 1}.mp4')
+            print('Trimming video to selected clip...')
+            trim_video_ffmpeg(input_path, clip.start_time, clip.end_time, trimmed_path)
+
+            # 5. Try to resize to 9:16 aspect ratio
+            output_path = os.path.join(temp_dir, f'yt_short_{clip_index + 1}.mp4')
+            if pyannote_resize_available:
+                try:
+                    print('Resizing video to 9:16 aspect ratio with pyannote...')
+                    aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
+                    aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
+                    crops = resize(
+                        video_file_path=trimmed_path,
+                        pyannote_auth_token=HUGGINGFACE_TOKEN,
+                        aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
+                    )
+                    resized_video_file = media_editor.resize_video(
+                        original_video_file=AudioVideoFile(trimmed_path),
+                        resized_video_file_path=output_path,
+                        width=crops.crop_width,
+                        height=crops.crop_height,
+                        segments=crops.to_dict()["segments"],
+                    )
+                    print(f'YouTube Short (9:16) saved to {output_path}')
+                except Exception as e:
+                    print(f'Resizing with pyannote failed: {e}')
+                    print('Switching to FFmpeg 9:16 fallback for remaining clips in this video...')
+                    pyannote_resize_available = False
+                    output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
+            else:
+                output_path = convert_to_vertical_ffmpeg(trimmed_path, output_path)
+
+            # Validate output aspect ratio and enforce 9:16 if needed.
+            try:
                 width, height = get_video_dimensions(output_path)
+                ratio = width / height if height else 0
+                print(f'Output dimensions: {width}x{height} (ratio: {ratio:.4f})')
+                if abs(ratio - (9 / 16)) > 0.01:
+                    print('Aspect ratio is not 9:16. Re-encoding with 9:16 fallback...')
+                    fixed_output_path = output_path.replace('.mp4', '_9x16.mp4')
+                    output_path = convert_to_vertical_ffmpeg(output_path, fixed_output_path)
+                    width, height = get_video_dimensions(output_path)
 
-            if width != 1080 or height != 1920:
-                print('Output is vertical but not standard 1080x1920. Normalizing...')
-                normalized_output_path = output_path.replace('.mp4', '_1080x1920.mp4')
-                output_path = normalize_vertical_output_ffmpeg(output_path, normalized_output_path)
-        except Exception as dim_err:
-            print(f'Could not validate output dimensions: {dim_err}')
+                if width != 1080 or height != 1920:
+                    print('Output is vertical but not exact 1080x1920. Normalizing...')
+                    normalized_output_path = output_path.replace('.mp4', '_1080x1920.mp4')
+                    output_path = normalize_vertical_output_ffmpeg(output_path, normalized_output_path)
+            except Exception as dim_err:
+                print(f'Could not validate output dimensions: {dim_err}')
 
-        # 6. Add styled subtitles
-        final_output = create_animated_subtitles(output_path, transcription, clip, output_path)
-        # 7. Generate viral title using Groq API
-        clip_text = " ".join([w["word"] for w in transcription.get_word_info() if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time])
-        groq_api_key = os.getenv('GROQ_API_KEY', 'your_groq_api_key_here')
-        title = get_viral_title(clip_text, groq_api_key)
-        print(f"\nViral Title for Clip {clip_index + 1}: {title}")
-        # 8. Save the final video with the viral title (keep spaces, punctuation, and emojis)
-        import shutil
-        viral_filename = safe_filename(title).strip() + ".mp4"
-        viral_path = os.path.join(OUTPUT_DIR, viral_filename)
-        shutil.copy(final_output, viral_path)
-        print(f"Final video saved as: {viral_path}\n")
+            # 6. Optionally add the logo overlay on the processed clip.
+            final_output = output_path
+            if resolved_logo_path:
+                logo_output_path = output_path.replace('.mp4', '_with_logo.mp4')
+                try:
+                    final_output = apply_logo_overlay_ffmpeg(
+                        output_path,
+                        logo_output_path,
+                        resolved_logo_path,
+                        logo_position,
+                    )
+                except Exception as logo_err:
+                    print(f'Could not apply logo overlay: {logo_err}')
+                    final_output = output_path
+
+            # 7. Generate social metadata (title, description, tags).
+            clip_text = " ".join([
+                w["word"] for w in transcription.get_word_info()
+                if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time
+            ])
+            title, description, tags = get_viral_metadata(clip_text)
+            print(f"\nMetadata for Clip {clip_index + 1}:")
+            print(f"  Title: {title}")
+            print(f"  Description: {description}")
+            print(f"  Tags: {tags}")
+
+            # 8. Save final clip using the generated title as filename (with collision-safe suffix).
+            safe_title = safe_filename(title).strip() or f"clip_{clip_index + 1}"
+            viral_filename = f"{safe_title}.mp4"
+            viral_path = os.path.join(OUTPUT_DIR, viral_filename)
+            suffix = 2
+            while os.path.exists(viral_path):
+                viral_filename = f"{safe_title}_{suffix}.mp4"
+                viral_path = os.path.join(OUTPUT_DIR, viral_filename)
+                suffix += 1
+            shutil.move(final_output, viral_path)
+            print(f"Final video saved as: {viral_path}")
+
+            # 9. Append metadata row to CSV.
+            clip_duration = clip.end_time - clip.start_time
+            metadata_row = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "source_video": video_file,
+                "source_url": _args.url or "",
+                "clip_index": str(clip_index + 1),
+                "clip_start_s": f"{clip.start_time:.3f}",
+                "clip_end_s": f"{clip.end_time:.3f}",
+                "clip_duration_s": f"{clip_duration:.3f}",
+                "clip_file": viral_filename,
+                "title": title,
+                "description": description,
+                "tags": tags,
+            }
+            append_clip_metadata_csv(METADATA_CSV_PATH, metadata_row)
+            print(f"Metadata appended to CSV: {METADATA_CSV_PATH}\n")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 print(f"\nSuccessfully created YouTube Shorts for {len(video_transcription_map)} video(s)!")

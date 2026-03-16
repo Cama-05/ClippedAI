@@ -9,6 +9,7 @@
 
 - **Smart Clip Detection**: AI identifies the most engaging moments in your videos
 - **Auto-Resize**: Automatically crops videos to 9:16 aspect ratio for YouTube Shorts
+- **Transparent Logo Overlay**: Adds your logo at the top of the exported clip with adjustable opacity
 - **Animated Subtitles**: Clean, bold subtitles with smart styling (white text, yellow for numbers/currency)
 - **Viral Title Generation**: AI generates catchy, titles optimized for engagement
 - **Transcription Caching**: Save time by reusing existing transcriptions
@@ -120,13 +121,28 @@
 
 **Note**: The first time you run the script, it will download the Pyannote models (~2GB). This may take several minutes depending on your internet connection.
 
-#### Groq API Key (Required for viral titles) - **100% FREE**
+#### Groq API Key (Optional - free provider for viral titles)
 
 1. Sign up at [Groq](https://console.groq.com/) (free tier available)
 2. Get your API key from the dashboard
 3. Add your API key to the `.env` file where `GROQ_API_KEY=your_groq_api_key_here`
 
-**Cost**: Both API keys are completely free to use!
+#### OpenAI API Key (Optional - paid provider for viral titles)
+
+1. Sign up at [OpenAI](https://platform.openai.com/)
+2. Create an API key from [API Keys](https://platform.openai.com/api-keys)
+3. Add your API key to the `.env` file where `OPENAI_API_KEY=your_openai_api_key_here`
+
+#### Select Metadata Provider in `.env`
+
+Use `LLM_PROVIDER` to choose which model provider generates title/description/tags:
+
+```env
+LLM_PROVIDER=groq      # free option
+# LLM_PROVIDER=openai  # paid option
+```
+
+If the selected provider key is missing, the script safely falls back to default metadata.
 
 ## Choosing the Right Transcription Model
 
@@ -194,18 +210,26 @@ All key settings can now be configured through the `.env` file or within `main.p
    cp /path/to/your/video.mp4 input/
    ```
 
-2. **Run the script**
+2. **Optional: provide a remote logo URL**
+
+   If you want a logo overlay, pass it at runtime with `--logo-url`.
+   This is intended for hosted assets such as S3, Cloudflare R2, or a CDN.
+   You can also set the position with `--logo-position`.
+
+3. **Run the script**
 
    ```bash
-   python main.py
+   python main.py --logo-url "https://your-bucket.s3.amazonaws.com/brand/logo.png" --logo-position center
    ```
 
-3. **Follow the prompts** to:
+   If `--logo-url` is omitted, the logo overlay is skipped.
+
+4. **Follow the prompts** to:
    - Match videos with existing transcriptions (if any)
    - Choose how many clips to generate per video
    - Let AI process and create your YouTube Shorts
 
-4. **Find your results** in the `output/` folder
+5. **Find your results** in the `output/` folder
 
 ## Customization
 
@@ -229,12 +253,49 @@ All key settings can now be configured through the `.env` file:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HUGGINGFACE_TOKEN` | your_huggingface_token_here | HuggingFace API token for speaker diarization |
-| `GROQ_API_KEY` | your_groq_api_key_here | Groq API key for viral title generation |
+| `LLM_PROVIDER` | groq | Metadata provider (`groq` or `openai`) |
+| `GROQ_API_KEY` | your_groq_api_key_here | Groq API key (used when `LLM_PROVIDER=groq`) |
+| `GROQ_MODEL` | llama-3.1-8b-instant | Groq model for metadata generation |
+| `OPENAI_API_KEY` | your_openai_api_key_here | OpenAI API key (used when `LLM_PROVIDER=openai`) |
+| `OPENAI_MODEL` | gpt-4o-mini | OpenAI model for metadata generation |
 | `MIN_CLIP_DURATION` | 45 | Minimum duration in seconds for YouTube Shorts |
 | `MAX_CLIP_DURATION` | 120 | Maximum duration in seconds for YouTube Shorts |
 | `TRANSCRIPTION_MODEL` | medium | Whisper model to use (tiny, base, small, medium, large-v1, large-v2) |
 | `ASPECT_RATIO_WIDTH` | 9 | Width for aspect ratio (used with height for video resizing) |
 | `ASPECT_RATIO_HEIGHT` | 16 | Height for aspect ratio (used with width for video resizing) |
+| `LOGO_OPACITY` | 0.55 | Logo transparency from `0.0` to `1.0` |
+| `LOGO_WIDTH_RATIO` | 0.50 | Logo width relative to the video width (0.50 = 540px on 1080x1920 output) |
+| `LOGO_EDGE_MARGIN` | 70 | Edge distance in pixels used for `top-center` and `bottom-center` logo positions |
+
+### Logo Overlay
+
+If `--logo-url` is provided, ClippedAI downloads that image for the current run and overlays it at the center of every exported clip.
+
+If `--logo-url` is not provided, no logo overlay is applied.
+
+Supported `--logo-position` values:
+
+- `center` (or `centro`)
+- `top-center` (or `centro-alto`)
+- `bottom-center` (or `centro-basso`)
+
+- Best format: transparent PNG
+- Default position: centered on the screen
+- Default opacity: `0.55`
+- Default size: `50%` of the video width (recommended logo asset: `540x540` PNG)
+
+Example `.env` configuration:
+
+```env
+LOGO_OPACITY=0.45
+LOGO_WIDTH_RATIO=0.50
+```
+
+Example run command:
+
+```bash
+python main.py --url "https://www.youtube.com/watch?v=..." --logo-url "https://your-cdn.example.com/brands/acme/logo.png" --logo-position top-center
+```
 
 ### Engagement Scoring
 
